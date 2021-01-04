@@ -1,0 +1,156 @@
+import nose
+import argparse
+import pytest
+import requests
+import yaml
+import os
+import logging
+import sys
+import deepmerge
+import glob
+from requests_toolbelt import sessions
+import pyjq
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def apply_rule(epic_record, rule_name, rule):
+    logging.debug('applying rule "%s" to epic "%s"', rule_name, epic_record['title'])
+    if isinstance(rule['spec'], str):
+        actions = pyjq.first(rule['spec'], value=epic_record)
+        actions = actions or []
+    elif isinstance(rule['spec'], dict) and 'actions' in rule['spec']:
+        conditions_met = True
+        for idx, condition in enumerate(rule['spec'].get('conditions', [])):
+            if bool(pyjq.first(condition, value=epic_record)):
+                logging.debug('condition %d met', idx)
+            else:
+                logging.debug('condition %d NOT met', idx)
+                conditions_met = False
+        if conditions_met:
+            actions = [pyjq.first(action, value=epic_record) for action in rule['spec']['actions']]
+        else:
+            actions = []
+    return actions
+
+def perform_create_issue(args, action):
+    iss = action['payload']
+    iss.setdefault('epic', action['object'])
+    iss.setdefault('epic_iid', iss['epic']['iid'])
+    resp = args.session.post('projects/%s/issues' % action['payload']['project_id'], json=iss)
+    resp.raise_for_status()
+    
+def perform_create_note(args, action):
+    resp = args.session.post('groups/%s/epics/%s/notes' % (action['object']['group_id'], action['object']['id']), json={'body': action['payload']['body']})
+    resp.raise_for_status()
+
+def perform_update_epic(args, action):
+    pass
+
+ACTIONS = {
+        'create_issue': perform_create_issue,
+        'create_note': perform_create_note,
+        'update_epic': perform_update_epic
+}
+
+def run_apply(args):
+    resp = args.session.get('groups/%s/epics?state=opened' % args.group_id)
+    resp.raise_for_status()
+    rules = args.rules_dict if not args.rule else {args.rule: args.rules_dict[args.rule]}
+    for epic in resp.json():
+        actions = []
+        epic['issues'] = args.session.get('groups/%s/epics/%s/issues' % (args.group_id, epic['iid'])).json()
+        for rule_name, rule in rules.items():
+            new_actions = apply_rule(epic, rule_name, rule)
+            for action in new_actions:
+                action['_rule_name'] = rule_name
+                action['object'] = {'title': epic['title'], 'id': epic['id'], 'group_id': epic['group_id'], 'iid': epic['iid']}
+            actions.extend(new_actions)
+        for action in actions:
+            logging.info('performing:\n' + yaml.dump(action))
+            if not args.dry_run:
+                action_function = ACTIONS[action['type']]
+                action_function(args, action)
+
+def read_rules(rules_directory):
+    result = {}
+    for f in glob.glob(os.path.join(rules_directory, '*.yaml')):
+        try:
+            these_rules = yaml.load(open(f), Loader=yaml.CLoader)
+        except yaml.scanner.ScannerError as e:
+            logging.error('cannot parse file %s', f)
+            print(e)
+            sys.exit(1)
+        for rule in these_rules.values():
+            rule['_file'] = f
+        result = deepmerge.always_merger.merge(result, these_rules)
+    return result
+
+
+def run_example(args):
+    rule = args.rules_dict[args.rule]
+    epic = args.session.get('groups/%s/epics/%s' % (args.group_id, args.epic_iid)).json()
+    epic['issues'] = args.session.get('groups/%s/epics/%s/issues' % (args.group_id, args.epic_iid)).json()
+    actions = apply_rule(epic, args.rule, rule)
+    example = {'input': epic, 'expected': actions}
+    print(yaml.dump(example))
+
+def run_test(args):
+    if args.rule:
+        test_rule(args.rule, args.rules_dict[args.rule])
+    else:
+        for rule_name, rule in args.rules_dict.items():
+            test_rule(rule_name, rule)
+
+def test_rule(rule_name, rule):
+    for idx, example in enumerate(rule.get('examples', [])):
+        actions = apply_rule(example['input'], rule_name, rule)
+        try:
+            nose.tools.assert_equal(actions, example['expected'])
+        except AssertionError as e:
+            logging.info('rule "%s" failed the test on example %d', rule_name, idx)
+            print(e)
+            continue
+
+
+def parse_command_line(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('--gitlab-url', default=os.getenv('GITLAB_URL'))
+    parser.add_argument('--private-token', default=os.getenv('PRIVATE_TOKEN'))
+    parser.add_argument('--group-id', default=os.getenv('GROUP_ID'))
+    parser.add_argument('--rules', default=os.getenv('RULES', './rules'))
+    parser.add_argument('--rule', help='rule name to test')
+
+    subparsers = parser.add_subparsers()
+
+    parser_apply = subparsers.add_parser('apply', help='apply the set of rules')
+    parser_apply.add_argument('--dry-run', action='store_true')
+    parser_apply.set_defaults(func=run_apply)
+
+    parser_test = subparsers.add_parser('test', help='test the rules')
+    parser_test.set_defaults(func=run_test)
+
+    parser_example = subparsers.add_parser('generate-example', help='generate example yaml')
+    parser_example.add_argument('--epic-iid', required=True, help='epic_iid to generate example from')
+    parser_example.set_defaults(func=run_example)
+
+    args = parser.parse_args(argv)
+    args.gitlab_url = args.gitlab_url.rstrip('/') + '/api/v4/'
+    session = sessions.BaseUrlSession(base_url=args.gitlab_url)
+    session.headers['private-token'] = args.private_token
+    args.session = session
+    logging.basicConfig(stream=sys.stdout,
+                        format='%(asctime)s | %(levelname)-5s | %(message).10000s',
+                        datefmt='%Y-%m-%d %H:%M:%S',
+                        level=logging.DEBUG if args.verbose else logging.INFO)
+    args.rules_dict = read_rules(args.rules)
+    args.func(args)
+
+
+def main():
+    parse_command_line(sys.argv[1:])
+    pytest.register_assert_rewrite()
+
+if __name__ == '__main__':
+    main()

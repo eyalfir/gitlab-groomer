@@ -1,0 +1,39 @@
+add create system design issue:
+  spec:
+    conditions:
+      - .labels | join(",") | test("system design::not ready")
+      - '[.issues | .[] | .labels | .[] | select(test("System Design"))] | length == 0'
+    actions:
+      - |
+        {
+          type: "create_issue",
+          payload: {
+            project_id: 1,
+            title: ("prepare system design for epic \"" + .title + "\""),
+            labels: ["System Design"],
+            assignee_ids: [111]
+          }
+        }
+      - |
+        {
+          type: "create_note",
+          payload: {
+            body: "found label `system design::not ready`, but not issue with the `System Design` label. Creating one and assigning to Architect"
+          }
+        }
+  examples:
+  - input:
+      labels: ['system design::not ready']
+      title: my epic
+      issues: []
+    expected:
+      - type: create_issue
+        payload:
+          project_id: 1
+          assignee_ids: [111]
+          title: prepare system design for epic "my epic"
+          labels:
+          - System Design
+      - type: create_note
+        payload:
+            body: "found label `system design::not ready`, but not issue with the `System Design` label. Creating one and assigning to Architect"

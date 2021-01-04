@@ -1,0 +1,7 @@
+verify type:
+  spec:
+    conditions:
+      - '[.labels | .[] | select(test("type::.*"))] | length == 0'
+      - '[.labels | .[] | select(test("needs attention"))] | length == 0'
+    actions:
+      - '{ type: "create_note", payload: { body: "missing type::* label. This needs attention.\n\n/label ~\"needs attention\"" } }'
